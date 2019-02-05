@@ -9,11 +9,11 @@
     "**/.*",
     "node_modules",
     "bower_components",
-    "transfersh-web/bower_components",
     "test",
     "tests"
   ],
   "dependencies": {
+    "videojs": "~7.4.2",
     "bootstrap": "~3.0.0",
     "modernizr": "~2.6.2",
     "uri.js": "~1.14.1",

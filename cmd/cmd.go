@@ -10,6 +10,7 @@ import (
 	"github.com/dutchcoders/transfer.sh/server"
 	"github.com/fatih/color"
 	"github.com/minio/cli"
+	"log"
 )
 
 var Version = "0.1"
@@ -54,6 +55,10 @@ var globalFlags = []cli.Flag{
 		Usage: "127.0.0.1:8443",
 		Value: "",
 	},
+	cli.BoolFlag{
+		Name:  "tls-listener-only",
+		Usage: "",
+	},
 	cli.StringFlag{
 		Name:  "tls-cert-file",
 		Value: "",
@@ -73,14 +78,24 @@ var globalFlags = []cli.Flag{
 		Value: "",
 	},
 	cli.StringFlag{
-		Name:  "provider",
-		Usage: "s3|local",
+		Name:  "ga-key",
+		Usage: "key for google analytics (front end)",
 		Value: "",
 	},
 	cli.StringFlag{
-		Name: "s3-endpoint",
-		Usage: "",
-		Value: "http://s3-eu-west-1.amazonaws.com",
+		Name:  "uservoice-key",
+		Usage: "key for user voice (front end)",
+		Value: "",
+	},
+	cli.StringFlag{
+		Name:  "provider",
+		Usage: "s3|gdrive|local",
+		Value: "",
+	},
+	cli.StringFlag{
+		Name:   "s3-endpoint",
+		Usage:  "",
+		Value:  "http://s3-eu-west-1.amazonaws.com",
 		EnvVar: "S3_ENDPOINT",
 	},
 	cli.StringFlag{
@@ -100,6 +115,16 @@ var globalFlags = []cli.Flag{
 		Usage:  "",
 		Value:  "",
 		EnvVar: "BUCKET",
+	},
+	cli.StringFlag{
+		Name:  "gdrive-client-json-filepath",
+		Usage: "",
+		Value: "",
+	},
+	cli.StringFlag{
+		Name:  "gdrive-local-config-path",
+		Usage: "",
+		Value: "",
 	},
 	cli.IntFlag{
 		Name:   "rate-limit",
@@ -139,6 +164,16 @@ var globalFlags = []cli.Flag{
 		Name:  "profiler",
 		Usage: "enable profiling",
 	},
+	cli.StringFlag{
+		Name:  "http-auth-user",
+		Usage: "user for http basic auth",
+		Value: "",
+	},
+	cli.StringFlag{
+		Name:  "http-auth-pass",
+		Usage: "pass for http basic auth",
+		Value: "",
+	},
 }
 
 type Cmd struct {
@@ -150,6 +185,8 @@ func VersionAction(c *cli.Context) {
 }
 
 func New() *Cmd {
+	logger := log.New(os.Stdout, "[transfer.sh]", log.LstdFlags)
+
 	app := cli.NewApp()
 	app.Name = "transfer.sh"
 	app.Author = ""
@@ -174,8 +211,11 @@ func New() *Cmd {
 			options = append(options, server.Listener(v))
 		}
 
-		if v := c.String("tls-listener"); v != "" {
-			options = append(options, server.TLSListener(v))
+		if v := c.String("tls-listener"); v == "" {
+		} else if c.Bool("tls-listener-only") {
+			options = append(options, server.TLSListener(v, true))
+		} else {
+			options = append(options, server.TLSListener(v, false))
 		}
 
 		if v := c.String("profile-listener"); v != "" {
@@ -186,8 +226,22 @@ func New() *Cmd {
 			options = append(options, server.WebPath(v))
 		}
 
+		if v := c.String("ga-key"); v != "" {
+			options = append(options, server.GoogleAnalytics(v))
+		}
+
+		if v := c.String("uservoice-key"); v != "" {
+			options = append(options, server.UserVoice(v))
+		}
+
 		if v := c.String("temp-path"); v != "" {
 			options = append(options, server.TempPath(v))
+		}
+
+		if v := c.String("log"); v != "" {
+			options = append(options, server.LogFile(logger, v))
+		} else {
+			options = append(options, server.Logger(logger))
 		}
 
 		if v := c.String("lets-encrypt-hosts"); v != "" {
@@ -220,6 +274,12 @@ func New() *Cmd {
 			options = append(options, server.ForceHTTPs())
 		}
 
+		if httpAuthUser := c.String("http-auth-user"); httpAuthUser == "" {
+		} else if httpAuthPass := c.String("http-auth-pass"); httpAuthPass == "" {
+		} else {
+			options = append(options, server.HttpAuthCredentials(httpAuthUser, httpAuthPass))
+		}
+
 		switch provider := c.String("provider"); provider {
 		case "s3":
 			if accessKey := c.String("aws-access-key"); accessKey == "" {
@@ -228,7 +288,19 @@ func New() *Cmd {
 				panic("secret-key not set.")
 			} else if bucket := c.String("bucket"); bucket == "" {
 				panic("bucket not set.")
-			} else if storage, err := server.NewS3Storage(accessKey, secretKey, bucket, c.String("s3-endpoint")); err != nil {
+			} else if storage, err := server.NewS3Storage(accessKey, secretKey, bucket, c.String("s3-endpoint"), logger); err != nil {
+				panic(err)
+			} else {
+				options = append(options, server.UseStorage(storage))
+			}
+		case "gdrive":
+			if clientJsonFilepath := c.String("gdrive-client-json-filepath"); clientJsonFilepath == "" {
+				panic("client-json-filepath not set.")
+			} else if localConfigPath := c.String("gdrive-local-config-path"); localConfigPath == "" {
+				panic("local-config-path not set.")
+			} else if basedir := c.String("basedir"); basedir == "" {
+				panic("basedir not set.")
+			} else if storage, err := server.NewGDriveStorage(clientJsonFilepath, localConfigPath, basedir, logger); err != nil {
 				panic(err)
 			} else {
 				options = append(options, server.UseStorage(storage))
@@ -236,7 +308,7 @@ func New() *Cmd {
 		case "local":
 			if v := c.String("basedir"); v == "" {
 				panic("basedir not set.")
-			} else if storage, err := server.NewLocalStorage(v); err != nil {
+			} else if storage, err := server.NewLocalStorage(v, logger); err != nil {
 				panic(err)
 			} else {
 				options = append(options, server.UseStorage(storage))
@@ -250,7 +322,7 @@ func New() *Cmd {
 		)
 
 		if err != nil {
-			fmt.Println(color.RedString("Error starting server: %s", err.Error()))
+			logger.Println(color.RedString("Error starting server: %s", err.Error()))
 			return
 		}
 

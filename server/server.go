@@ -26,7 +26,6 @@ package server
 
 import (
 	"errors"
-	"fmt"
 	"log"
 	"math/rand"
 	"mime"
@@ -54,12 +53,13 @@ import (
 	assetfs "github.com/elazarl/go-bindata-assetfs"
 
 	autocert "golang.org/x/crypto/acme/autocert"
+	"path/filepath"
 )
 
 const SERVER_INFO = "transfer.sh"
 
 // parse request with maximum memory of _24Kilobits
-const _24K = (1 << 20) * 24
+const _24K = (1 << 10) * 24
 
 type OptionFn func(*Server)
 
@@ -82,9 +82,22 @@ func Listener(s string) OptionFn {
 
 }
 
-func TLSListener(s string) OptionFn {
+func GoogleAnalytics(gaKey string) OptionFn {
+	return func(srvr *Server) {
+		srvr.gaKey = gaKey
+	}
+}
+
+func UserVoice(userVoiceKey string) OptionFn {
+	return func(srvr *Server) {
+		srvr.userVoiceKey = userVoiceKey
+	}
+}
+
+func TLSListener(s string, t bool) OptionFn {
 	return func(srvr *Server) {
 		srvr.TLSListenerString = s
+		srvr.TLSListenerOnly = t
 	}
 
 }
@@ -97,24 +110,39 @@ func ProfileListener(s string) OptionFn {
 
 func WebPath(s string) OptionFn {
 	return func(srvr *Server) {
+		if s[len(s)-1:] != "/" {
+			s = s + string(filepath.Separator)
+		}
+
 		srvr.webPath = s
 	}
 }
 
 func TempPath(s string) OptionFn {
 	return func(srvr *Server) {
+		if s[len(s)-1:] != "/" {
+			s = s + string(filepath.Separator)
+		}
+
 		srvr.tempPath = s
 	}
 }
 
-func LogFile(s string) OptionFn {
+func LogFile(logger *log.Logger, s string) OptionFn {
 	return func(srvr *Server) {
 		f, err := os.OpenFile(s, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 		if err != nil {
 			log.Fatalf("error opening file: %v", err)
 		}
 
-		log.SetOutput(f)
+		logger.SetOutput(f)
+		srvr.logger = logger
+	}
+}
+
+func Logger(logger *log.Logger) OptionFn {
+	return func(srvr *Server) {
+		srvr.logger = logger
 	}
 }
 
@@ -181,7 +209,19 @@ func TLSConfig(cert, pk string) OptionFn {
 	}
 }
 
+func HttpAuthCredentials(user string, pass string) OptionFn {
+	return func(srvr *Server) {
+		srvr.AuthUser = user
+		srvr.AuthPass = pass
+	}
+}
+
 type Server struct {
+	AuthUser string
+	AuthPass string
+
+	logger *log.Logger
+
 	tlsConfig *tls.Config
 
 	profilerEnabled bool
@@ -199,7 +239,11 @@ type Server struct {
 
 	tempPath string
 
-	webPath string
+	webPath      string
+	gaKey        string
+	userVoiceKey string
+
+	TLSListenerOnly bool
 
 	ListenerString        string
 	TLSListenerString     string
@@ -227,9 +271,13 @@ func init() {
 }
 
 func (s *Server) Run() {
+	listening := false
+
 	if s.profilerEnabled {
+		listening = true
+
 		go func() {
-			fmt.Println("Profiled listening at: :6060")
+			s.logger.Println("Profiled listening at: :6060")
 
 			http.ListenAndServe(":6060", nil)
 		}()
@@ -240,7 +288,7 @@ func (s *Server) Run() {
 	var fs http.FileSystem
 
 	if s.webPath != "" {
-		log.Println("Using static file path: ", s.webPath)
+		s.logger.Println("Using static file path: ", s.webPath)
 
 		fs = http.Dir(s.webPath)
 
@@ -259,7 +307,7 @@ func (s *Server) Run() {
 		for _, path := range web.AssetNames() {
 			bytes, err := web.Asset(path)
 			if err != nil {
-				log.Panicf("Unable to parse: path=%s, err=%s", path, err)
+				s.logger.Panicf("Unable to parse: path=%s, err=%s", path, err)
 			}
 
 			htmlTemplates.New(stripPrefix(path)).Parse(string(bytes))
@@ -284,6 +332,9 @@ func (s *Server) Run() {
 	r.HandleFunc("/({files:.*}).tar", s.tarHandler).Methods("GET")
 	r.HandleFunc("/({files:.*}).tar.gz", s.tarGzHandler).Methods("GET")
 
+	r.HandleFunc("/{token}/{filename}", s.headHandler).Methods("HEAD")
+	r.HandleFunc("/{action:(?:download|get|inline)}/{token}/{filename}", s.headHandler).Methods("HEAD")
+
 	r.HandleFunc("/{token}/{filename}", s.previewHandler).MatcherFunc(func(r *http.Request, rm *mux.RouteMatch) (match bool) {
 		match = false
 
@@ -298,7 +349,7 @@ func (s *Server) Run() {
 
 		u, err := url.Parse(r.Referer())
 		if err != nil {
-			log.Fatal(err)
+			s.logger.Fatal(err)
 			return
 		}
 
@@ -312,36 +363,44 @@ func (s *Server) Run() {
 	}
 
 	r.HandleFunc("/{token}/{filename}", getHandlerFn).Methods("GET")
-	r.HandleFunc("/get/{token}/{filename}", getHandlerFn).Methods("GET")
-	r.HandleFunc("/download/{token}/{filename}", getHandlerFn).Methods("GET")
+	r.HandleFunc("/{action:(?:download|get|inline)}/{token}/{filename}", getHandlerFn).Methods("GET")
 
 	r.HandleFunc("/{filename}/virustotal", s.virusTotalHandler).Methods("PUT")
 	r.HandleFunc("/{filename}/scan", s.scanHandler).Methods("PUT")
-	r.HandleFunc("/put/{filename}", s.putHandler).Methods("PUT")
-	r.HandleFunc("/upload/{filename}", s.putHandler).Methods("PUT")
-	r.HandleFunc("/{filename}", s.putHandler).Methods("PUT")
-	r.HandleFunc("/", s.postHandler).Methods("POST")
+	r.HandleFunc("/put/{filename}", s.BasicAuthHandler(http.HandlerFunc(s.putHandler))).Methods("PUT")
+	r.HandleFunc("/upload/{filename}", s.BasicAuthHandler(http.HandlerFunc(s.putHandler))).Methods("PUT")
+	r.HandleFunc("/{filename}", s.BasicAuthHandler(http.HandlerFunc(s.putHandler))).Methods("PUT")
+	r.HandleFunc("/", s.BasicAuthHandler(http.HandlerFunc(s.postHandler))).Methods("POST")
 	// r.HandleFunc("/{page}", viewHandler).Methods("GET")
+
+	r.HandleFunc("/{token}/{filename}/{deletionToken}", s.deleteHandler).Methods("DELETE")
 
 	r.NotFoundHandler = http.HandlerFunc(s.notFoundHandler)
 
 	mime.AddExtensionType(".md", "text/x-markdown")
 
-	log.Printf("Transfer.sh server started.\nlistening on port: %v\nusing temp folder: %s\nusing storage provider: %s", s.ListenerString, s.tempPath, s.storage.Type())
-	log.Printf("---------------------------")
+	s.logger.Printf("Transfer.sh server started.\nusing temp folder: %s\nusing storage provider: %s", s.tempPath, s.storage.Type())
 
-	h := handlers.PanicHandler(handlers.LogHandler(LoveHandler(s.RedirectHandler(r)), handlers.NewLogOptions(log.Printf, "_default_")), nil)
+	h := handlers.PanicHandler(handlers.LogHandler(LoveHandler(s.RedirectHandler(r)), handlers.NewLogOptions(s.logger.Printf, "_default_")), nil)
 
-	srvr := &http.Server{
-		Addr:    s.ListenerString,
-		Handler: h,
+	if !s.TLSListenerOnly {
+		srvr := &http.Server{
+			Addr:    s.ListenerString,
+			Handler: h,
+		}
+
+		listening = true
+		s.logger.Printf("listening on port: %v\n", s.ListenerString)
+
+		go func() {
+			srvr.ListenAndServe()
+		}()
 	}
 
-	go func() {
-		srvr.ListenAndServe()
-	}()
-
 	if s.TLSListenerString != "" {
+		listening = true
+		s.logger.Printf("listening on port: %v\n", s.TLSListenerString)
+
 		go func() {
 			s := &http.Server{
 				Addr:      s.TLSListenerString,
@@ -355,48 +414,17 @@ func (s *Server) Run() {
 		}()
 	}
 
-	/*
-		cacheDir := "/var/cache/autocert"
-
-		if s.LetsEncryptCache != "" {
-			cacheDir = s.LetsEncryptCache
-		}
-
-		m := autocert.Manager{
-			Prompt: autocert.AcceptTOS,
-			Cache:  autocert.DirCache(cacheDir),
-			HostPolicy: func(_ context.Context, host string) error {
-				if !strings.HasSuffix(host, "transfer.sh") {
-					return errors.New("acme/autocert: host not configured")
-				}
-				return nil
-			},
-		}
-
-		if s.TLSListenerString != "" {
-			go func() {
-				s := &http.Server{
-					Addr:      ":https",
-					Handler:   lh,
-					TLSConfig: &tls.Config{GetCertificate: m.GetCertificate},
-				}
-
-				if err := s.ListenAndServeTLS("", ""); err != nil {
-					panic(err)
-				}
-			}()
-
-			if err := http.ListenAndServe(c.ListenerString, RedirectHandler()); err != nil {
-				panic(err)
-			}
-		}
-	*/
+	s.logger.Printf("---------------------------")
 
 	term := make(chan os.Signal, 1)
 	signal.Notify(term, os.Interrupt)
 	signal.Notify(term, syscall.SIGTERM)
 
-	<-term
+	if listening {
+		<-term
+	} else {
+		s.logger.Printf("No listener active.")
+	}
 
-	log.Printf("Server stopped.")
+	s.logger.Printf("Server stopped.")
 }

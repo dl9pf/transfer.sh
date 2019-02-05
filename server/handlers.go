@@ -58,6 +58,9 @@ import (
 	web "github.com/dutchcoders/transfer.sh-web"
 	"github.com/gorilla/mux"
 	"github.com/russross/blackfriday"
+
+	"encoding/base64"
+	qrcode "github.com/skip2/go-qrcode"
 )
 
 var (
@@ -92,7 +95,6 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 
 /* The preview handler will show a preview of the content for browsers (accept type text/html), and referer is not transfer.sh */
 func (s *Server) previewHandler(w http.ResponseWriter, r *http.Request) {
-
 	vars := mux.Vars(r)
 
 	token := vars["token"]
@@ -130,7 +132,8 @@ func (s *Server) previewHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if strings.HasPrefix(contentType, "text/x-markdown") || strings.HasPrefix(contentType, "text/markdown") {
-			output := blackfriday.MarkdownCommon(data)
+			escapedData := html.EscapeString(string(data))
+			output := blackfriday.MarkdownCommon([]byte(escapedData))
 			content = html_template.HTML(output)
 		} else if strings.HasPrefix(contentType, "text/plain") {
 			content = html_template.HTML(fmt.Sprintf("<pre>%s</pre>", html.EscapeString(string(data))))
@@ -147,18 +150,41 @@ func (s *Server) previewHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	resolvedUrl := resolveUrl(r, getURL(r).ResolveReference(r.URL), true)
+	var png []byte
+	png, err = qrcode.Encode(resolvedUrl, qrcode.High, 150)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	qrCode := base64.StdEncoding.EncodeToString(png)
+
+	hostname := getURL(r).Host
+	webAddress := resolveWebAddress(r)
+
 	data := struct {
 		ContentType   string
 		Content       html_template.HTML
 		Filename      string
 		Url           string
+		Hostname      string
+		WebAddress    string
 		ContentLength uint64
+		GAKey         string
+		UserVoiceKey  string
+		QRCode        string
 	}{
 		contentType,
 		content,
 		filename,
-		r.URL.String(),
+		resolvedUrl,
+		hostname,
+		webAddress,
 		contentLength,
+		s.gaKey,
+		s.userVoiceKey,
+		qrCode,
 	}
 
 	if err := htmlTemplates.ExecuteTemplate(w, templatePath, data); err != nil {
@@ -174,13 +200,28 @@ func (s *Server) previewHandler(w http.ResponseWriter, r *http.Request) {
 func (s *Server) viewHandler(w http.ResponseWriter, r *http.Request) {
 	// vars := mux.Vars(r)
 
+	hostname := getURL(r).Host
+	webAddress := resolveWebAddress(r)
+
+	data := struct {
+		Hostname     string
+		WebAddress   string
+		GAKey        string
+		UserVoiceKey string
+	}{
+		hostname,
+		webAddress,
+		s.gaKey,
+		s.userVoiceKey,
+	}
+
 	if acceptsHTML(r.Header) {
-		if err := htmlTemplates.ExecuteTemplate(w, "index.html", nil); err != nil {
+		if err := htmlTemplates.ExecuteTemplate(w, "index.html", data); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 	} else {
-		if err := textTemplates.ExecuteTemplate(w, "index.txt", nil); err != nil {
+		if err := textTemplates.ExecuteTemplate(w, "index.txt", data); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -233,18 +274,18 @@ func (s *Server) postHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
+			var file *os.File
 			var reader io.Reader
 
 			if n > _24K {
-				file, err := ioutil.TempFile(s.tempPath, "transfer-")
+				file, err = ioutil.TempFile(s.tempPath, "transfer-")
 				if err != nil {
 					log.Fatal(err)
 				}
-				defer file.Close()
 
 				n, err = io.Copy(file, io.MultiReader(&b, f))
 				if err != nil {
-					os.Remove(file.Name())
+					cleanTmpFile(file)
 
 					log.Printf("%s", err.Error())
 					http.Error(w, err.Error(), 500)
@@ -264,10 +305,14 @@ func (s *Server) postHandler(w http.ResponseWriter, r *http.Request) {
 			if err := json.NewEncoder(buffer).Encode(metadata); err != nil {
 				log.Printf("%s", err.Error())
 				http.Error(w, errors.New("Could not encode metadata").Error(), 500)
+
+				cleanTmpFile(file)
 				return
 			} else if err := s.storage.Put(token, fmt.Sprintf("%s.metadata", filename), buffer, "text/json", uint64(buffer.Len())); err != nil {
 				log.Printf("%s", err.Error())
 				http.Error(w, errors.New("Could not save metadata").Error(), 500)
+
+				cleanTmpFile(file)
 				return
 			}
 
@@ -281,8 +326,17 @@ func (s *Server) postHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			relativeURL, _ := url.Parse(path.Join(token, filename))
-			fmt.Fprint(w, getURL(r).ResolveReference(relativeURL).String())
+			fmt.Fprintln(w, getURL(r).ResolveReference(relativeURL).String())
+
+			cleanTmpFile(file)
 		}
+	}
+}
+
+func cleanTmpFile(f *os.File) {
+	if f != nil {
+		f.Close()
+		os.Remove(f.Name())
 	}
 }
 
@@ -297,14 +351,17 @@ type Metadata struct {
 	MaxDownloads int
 	// MaxDate contains the max age of the file
 	MaxDate time.Time
+	// DeletionToken contains the token to match against for deletion
+	DeletionToken string
 }
 
 func MetadataForRequest(contentType string, r *http.Request) Metadata {
 	metadata := Metadata{
-		ContentType:  contentType,
-		MaxDate:      time.Now().Add(time.Hour * 24 * 365 * 10),
-		Downloads:    0,
-		MaxDownloads: 99999999,
+		ContentType:   contentType,
+		MaxDate:       time.Now().Add(time.Hour * 24 * 365 * 10),
+		Downloads:     0,
+		MaxDownloads:  99999999,
+		DeletionToken: Encode(10000000+int64(rand.Intn(1000000000))) + Encode(10000000+int64(rand.Intn(1000000000))),
 	}
 
 	if v := r.Header.Get("Max-Downloads"); v == "" {
@@ -349,19 +406,20 @@ func (s *Server) putHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		var file *os.File
+
 		if n > _24K {
-			file, err := ioutil.TempFile(s.tempPath, "transfer-")
+			file, err = ioutil.TempFile(s.tempPath, "transfer-")
 			if err != nil {
 				log.Printf("%s", err.Error())
 				http.Error(w, err.Error(), 500)
 				return
 			}
 
-			defer file.Close()
+			defer cleanTmpFile(file)
 
 			n, err = io.Copy(file, io.MultiReader(&b, f))
 			if err != nil {
-				os.Remove(file.Name())
 				log.Printf("%s", err.Error())
 				http.Error(w, err.Error(), 500)
 				return
@@ -373,6 +431,12 @@ func (s *Server) putHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		contentLength = n
+	}
+
+	if contentLength == 0 {
+		log.Print("Empty content-length")
+		http.Error(w, errors.New("Could not uplpoad empty file").Error(), 400)
+		return
 	}
 
 	contentType := r.Header.Get("Content-Type")
@@ -411,11 +475,39 @@ func (s *Server) putHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
 
 	relativeURL, _ := url.Parse(path.Join(token, filename))
-	fmt.Fprint(w, getURL(r).ResolveReference(relativeURL).String())
+	deleteUrl, _ := url.Parse(path.Join(token, filename, metadata.DeletionToken))
+
+	w.Header().Set("X-Url-Delete", resolveUrl(r, deleteUrl, true))
+
+	fmt.Fprint(w, resolveUrl(r, relativeURL, false))
+}
+
+func resolveUrl(r *http.Request, u *url.URL, absolutePath bool) string {
+	if u.RawQuery != "" {
+		u.Path = fmt.Sprintf("%s?%s", u.Path, url.QueryEscape(u.RawQuery))
+		u.RawQuery = ""
+	}
+
+	if u.Fragment != "" {
+		u.Path = fmt.Sprintf("%s#%s", u.Path, u.Fragment)
+		u.Fragment = ""
+	}
+
+	if absolutePath {
+		r.URL.Path = ""
+	}
+
+	return getURL(r).ResolveReference(u).String()
+}
+
+func resolveWebAddress(r *http.Request) string {
+	url := getURL(r)
+
+	return fmt.Sprintf("%s://%s", url.ResolveReference(url).Scheme, url.ResolveReference(url).Host)
 }
 
 func getURL(r *http.Request) *url.URL {
-	u := *r.URL
+	u, _ := url.Parse(r.URL.String())
 
 	if r.TLS != nil {
 		u.Scheme = "https"
@@ -438,7 +530,7 @@ func getURL(r *http.Request) *url.URL {
 		}
 	}
 
-	return &u
+	return u
 }
 
 func (s *Server) Lock(token, filename string) error {
@@ -496,6 +588,54 @@ func (s *Server) CheckMetadata(token, filename string) error {
 	}
 
 	return nil
+}
+
+func (s *Server) CheckDeletionToken(deletionToken, token, filename string) error {
+	s.Lock(token, filename)
+	defer s.Unlock(token, filename)
+
+	var metadata Metadata
+
+	r, _, _, err := s.storage.Get(token, fmt.Sprintf("%s.metadata", filename))
+	if s.storage.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+
+	defer r.Close()
+
+	if err := json.NewDecoder(r).Decode(&metadata); err != nil {
+		return err
+	} else if metadata.DeletionToken != deletionToken {
+		return errors.New("Deletion token doesn't match.")
+	}
+
+	return nil
+}
+
+func (s *Server) deleteHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+
+	token := vars["token"]
+	filename := vars["filename"]
+	deletionToken := vars["deletionToken"]
+
+	if err := s.CheckDeletionToken(deletionToken, token, filename); err != nil {
+		log.Printf("Error metadata: %s", err.Error())
+		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+		return
+	}
+
+	err := s.storage.Delete(token, filename)
+	if s.storage.IsNotExist(err) {
+		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+		return
+	} else if err != nil {
+		log.Printf("%s", err.Error())
+		http.Error(w, "Could not delete file.", 500)
+		return
+	}
 }
 
 func (s *Server) zipHandler(w http.ResponseWriter, r *http.Request) {
@@ -693,9 +833,37 @@ func (s *Server) tarHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) headHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+
+	token := vars["token"]
+	filename := vars["filename"]
+
+	if err := s.CheckMetadata(token, filename); err != nil {
+		log.Printf("Error metadata: %s", err.Error())
+		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+		return
+	}
+
+	contentType, contentLength, err := s.storage.Head(token, filename)
+	if s.storage.IsNotExist(err) {
+		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+		return
+	} else if err != nil {
+		log.Printf("%s", err.Error())
+		http.Error(w, "Could not retrieve file.", 500)
+		return
+	}
+
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Length", strconv.FormatUint(contentLength, 10))
+	w.Header().Set("Connection", "close")
+}
+
 func (s *Server) getHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 
+	action := vars["action"]
 	token := vars["token"]
 	filename := vars["filename"]
 
@@ -717,16 +885,37 @@ func (s *Server) getHandler(w http.ResponseWriter, r *http.Request) {
 
 	defer reader.Close()
 
+	var disposition string
+
+	if action == "inline" {
+		disposition = "inline"
+	} else {
+		disposition = "attachment"
+	}
+
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Length", strconv.FormatUint(contentLength, 10))
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
-	w.Header().Set("Connection", "close")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("%s; filename=\"%s\"", disposition, filename))
+	w.Header().Set("Connection", "keep-alive")
 
-	if _, err = io.Copy(w, reader); err != nil {
+	file, err := ioutil.TempFile(s.tempPath, "range-")
+	if err != nil {
 		log.Printf("%s", err.Error())
 		http.Error(w, "Error occurred copying to output stream", 500)
 		return
 	}
+
+	defer cleanTmpFile(file)
+
+	tee := io.TeeReader(reader, file)
+	_, err = ioutil.ReadAll(tee)
+	if err != nil {
+		log.Printf("%s", err.Error())
+		http.Error(w, "Error occurred copying to output stream", 500)
+		return
+	}
+
+	http.ServeContent(w, r, filename, time.Now(), file)
 }
 
 func (s *Server) RedirectHandler(h http.Handler) http.HandlerFunc {
@@ -757,6 +946,30 @@ func LoveHandler(h http.Handler) http.HandlerFunc {
 		w.Header().Set("x-made-with", "<3 by DutchCoders")
 		w.Header().Set("x-served-by", "Proudly served by DutchCoders")
 		w.Header().Set("Server", "Transfer.sh HTTP Server 1.0")
+		h.ServeHTTP(w, r)
+	}
+}
+
+func (s *Server) BasicAuthHandler(h http.Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.AuthUser == "" || s.AuthPass == "" {
+			h.ServeHTTP(w, r)
+			return
+		}
+
+		w.Header().Set("WWW-Authenticate", "Basic realm=\"Restricted\"")
+
+		username, password, authOK := r.BasicAuth()
+		if authOK == false {
+			http.Error(w, "Not authorized", 401)
+			return
+		}
+
+		if username != s.AuthUser || password != s.AuthPass {
+			http.Error(w, "Not authorized", 401)
+			return
+		}
+
 		h.ServeHTTP(w, r)
 	}
 }
